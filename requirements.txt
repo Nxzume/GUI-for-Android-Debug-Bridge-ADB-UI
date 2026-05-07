@@ -1,0 +1,17 @@
+# ADB GUI Tool for Windows
+# Requirements:
+# - Python 3.8 or higher
+# - PyQt6 for modern GUI
+# - ADB (Android Debug Bridge) installed on your system
+
+PyQt6>=6.6.0
+
+# Installation:
+# 1. Install Python 3.8+ from https://www.python.org/downloads/
+# 2. Install dependencies: pip install -r requirements.txt
+# 3. Download Android SDK Platform Tools from: https://developer.android.com/studio/releases/platform-tools
+# 4. Extract the platform-tools folder to a location of your choice
+# 5. On first launch, the application will prompt you to select the platform-tools folder
+# 6. The selected path will be saved in settings.json for future use
+# 7. Enable USB debugging on your Android device (Settings → Developer Options)
+# 8. Connect device via USB and run: python adb_gui.py

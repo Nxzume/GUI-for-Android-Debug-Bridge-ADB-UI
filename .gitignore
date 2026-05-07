@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# User-specific files
+settings.json
+degoogle_state.json
+
+# User-generated content
+screenshots/
+apks/
+*.png
+*.jpg
+*.jpeg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+
+# PyInstaller: ignore build intermediates but ship the packaged exe under dist/
+build/
+dist/*
+!dist/ADB_GUI.exe
+*.spec.bak
+*.pyc
+
