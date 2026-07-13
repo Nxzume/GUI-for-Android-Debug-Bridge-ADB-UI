@@ -19,6 +19,25 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QUrl
 from PyQt6.QtGui import QFont, QColor, QPalette, QDrag
 
 
+def quote_cmd_arg(path):
+    """Quote a path for inclusion in an ADB command string (POSIX shlex-safe)."""
+    path = str(path)
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def adb_install_succeeded(result):
+    """True when adb install/install-multiple actually succeeded."""
+    if not result or not result.get("success"):
+        return False
+    combined = f"{result.get('stdout') or ''}\n{result.get('stderr') or ''}".lower()
+    if "failure" in combined:
+        return False
+    if "error:" in combined and "success" not in combined:
+        return False
+    return True
+
+
 # ============================================================================
 # DeGoogle package lists
 # ----------------------------------------------------------------------------
@@ -331,6 +350,10 @@ class ADBGUI(QMainWindow):
     # Signal for showing custom dialog (must be defined at class level)
     custom_dialog_ready = pyqtSignal(dict)
     app_list_ready = pyqtSignal(list)
+    # Thread-safe UI update signals
+    log_signal = pyqtSignal(str, str)       # message, level
+    status_signal = pyqtSignal(str)         # status bar text
+    devices_ready = pyqtSignal(object, bool)  # devices list | {error: ...}, silent
     
     def __init__(self):
         super().__init__()
@@ -380,6 +403,7 @@ class ADBGUI(QMainWindow):
         
         # DeGoogle state storage
         self.degoogle_state_file = os.path.join(project_dir, 'degoogle_state.json')
+        self._json_load_warnings = []
         self.degoogle_state = self.load_degoogle_state()
         
         # Settings storage
@@ -427,22 +451,35 @@ class ADBGUI(QMainWindow):
         # Set up logging callback for ADB manager
         self.adb.log_callback = self.log
         self.current_device = None
+        self.device_status_map = {}
         self.log_thread = None
         self.log_running = False
+        self._logcat_process = None
+        self._refresh_in_progress = False
+        self._refresh_pending = None
+        
+        # Wire thread-safe UI signals before any background work
+        self.log_signal.connect(self._log_impl)
+        self.status_signal.connect(self._status_impl)
+        self.devices_ready.connect(self._apply_devices_result)
+        self.custom_dialog_ready.connect(self._show_custom_dialog)
+        self.app_list_ready.connect(self.show_app_list_window)
         
         self.setup_ui()
         self.update_adb_path_display()
+        
+        # Warn about corrupt JSON that was silently reset during load
+        for warning in self._json_load_warnings:
+            self.log(warning, "WARNING")
+            QMessageBox.warning(self, "Settings Warning", warning)
+        self._json_load_warnings.clear()
+        
         self.refresh_devices()
         
         # Auto-refresh devices every 5 seconds (silent mode to avoid log spam)
         self.auto_refresh_timer = QTimer()
         self.auto_refresh_timer.timeout.connect(lambda: self.refresh_devices(silent=True))
         self.auto_refresh_timer.start(5000)
-        
-        # Connect signal for custom dialog
-        self.custom_dialog_ready.connect(self._show_custom_dialog)
-        # Connect signal for app list dialog
-        self.app_list_ready.connect(self.show_app_list_window)
     
     def setup_ui(self):
         """Setup the modern user interface"""
@@ -652,10 +689,20 @@ class ADBGUI(QMainWindow):
         return btn
     
     def log(self, message, level="INFO"):
-        """Add message to output"""
+        """Add message to output (thread-safe)."""
+        if not hasattr(self, "output_text"):
+            return
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() is not app.thread():
+            self.log_signal.emit(message, level)
+            return
+        self._log_impl(message, level)
+
+    def _log_impl(self, message, level="INFO"):
+        if not hasattr(self, "output_text"):
+            return
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.output_text.append(f"[{timestamp}] [{level}] {message}")
-        # Auto-scroll to bottom
         scrollbar = self.output_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
     
@@ -664,8 +711,18 @@ class ADBGUI(QMainWindow):
         self.output_text.clear()
     
     def update_status(self, message):
-        """Update status bar"""
-        self.status_bar.setText(message)
+        """Update status bar (thread-safe)."""
+        if not hasattr(self, "status_bar"):
+            return
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() is not app.thread():
+            self.status_signal.emit(message)
+            return
+        self._status_impl(message)
+
+    def _status_impl(self, message):
+        if hasattr(self, "status_bar"):
+            self.status_bar.setText(message)
     
     def update_adb_path_display(self):
         """Update ADB path display label"""
@@ -677,111 +734,161 @@ class ADBGUI(QMainWindow):
             self.adb_path_label.setStyleSheet(f"color: {self.colors['error']};")
     
     def refresh_devices(self, silent=False):
-        """Refresh list of connected devices
+        """Refresh list of connected devices (ADB work runs off the UI thread).
         
         Args:
             silent: If True, don't log routine refresh messages (for auto-refresh)
         """
+        if self._refresh_in_progress:
+            # Coalesce overlapping refreshes; run one more when the current finishes.
+            self._refresh_pending = silent
+            return
+        self._refresh_in_progress = True
         if not silent:
             self.update_status("Refreshing devices...")
-        
-        # Test ADB connection first
-        test_result = self.adb.run_command('version')
-        if not test_result['success']:
-            error_msg = test_result['stderr'] if test_result['stderr'] else "Unknown error"
-            self.log(f"ADB test failed: {error_msg}", "ERROR")
-            self.log(f"ADB path: {self.adb.adb_path}", "ERROR")
-            self.update_status(f"ADB error: {error_msg[:50]}")
-            self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
-            self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
-            return
-        
-        devices = self.adb.get_devices(silent=silent)
-        
-        # Get current device list for comparison
-        current_device_ids = set()
-        if hasattr(self, 'device_display_map'):
-            current_device_ids = set(self.device_display_map.values())
-        
-        if devices:
-            # Create display strings with device name/model
-            device_list = []
-            device_display_map = {}  # Map display string to device ID
-            new_device_ids = set()
-            
-            for d in devices:
-                device_id = d['id']
-                new_device_ids.add(device_id)
-                model = d.get('model')
-                manufacturer = d.get('manufacturer', '')
-                product = d.get('product')
-                
-                # Build display name
-                if model:
-                    if manufacturer:
-                        display_name = f"{manufacturer} {model}"
-                    else:
-                        display_name = model
-                elif product:
-                    display_name = product.replace('_', ' ').title()
+
+        def worker():
+            try:
+                test_result = self.adb.run_command("version")
+                if not test_result["success"]:
+                    error_msg = test_result["stderr"] if test_result["stderr"] else "Unknown error"
+                    self.devices_ready.emit({"error": error_msg, "adb_path": self.adb.adb_path}, silent)
+                    return
+                devices = self.adb.get_devices(silent=silent)
+                self.devices_ready.emit(devices, silent)
+            except Exception as e:
+                self.devices_ready.emit({"error": str(e)}, silent)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_devices_result(self, result, silent):
+        """Apply device list (or error) on the UI thread."""
+        self._refresh_in_progress = False
+        pending = self._refresh_pending
+        self._refresh_pending = None
+
+        try:
+            if isinstance(result, dict) and "error" in result:
+                error_msg = result["error"]
+                self.log(f"ADB test failed: {error_msg}", "ERROR")
+                if result.get("adb_path"):
+                    self.log(f"ADB path: {result['adb_path']}", "ERROR")
+                self.update_status(f"ADB error: {error_msg[:50]}")
+                self.device_info_label.setText(f"ADB Error: {error_msg[:100]}")
+                self.device_info_label.setStyleSheet(f"color: {self.colors['error']};")
+                return
+
+            devices = result or []
+
+            current_device_ids = set()
+            if hasattr(self, "device_display_map"):
+                current_device_ids = set(self.device_display_map.values())
+
+            signal_disconnected = False
+            try:
+                self.device_combo.currentTextChanged.disconnect()
+                signal_disconnected = True
+            except TypeError:
+                pass
+
+            try:
+                if devices:
+                    device_list = []
+                    device_display_map = {}
+                    device_status_map = {}
+                    new_device_ids = set()
+
+                    for d in devices:
+                        device_id = d["id"]
+                        new_device_ids.add(device_id)
+                        status = d.get("status", "device")
+                        device_status_map[device_id] = status
+                        model = d.get("model")
+                        manufacturer = d.get("manufacturer", "")
+                        product = d.get("product")
+
+                        if model:
+                            display_name = f"{manufacturer} {model}".strip() if manufacturer else model
+                        elif product:
+                            display_name = product.replace("_", " ").title()
+                        else:
+                            display_name = "Unknown Device"
+
+                        if status != "device":
+                            display_str = f"{display_name} [{status}] ({device_id})"
+                        else:
+                            display_str = f"{display_name} ({device_id})"
+                        device_list.append(display_str)
+                        device_display_map[display_str] = device_id
+
+                    devices_changed = current_device_ids != new_device_ids
+
+                    self.device_combo.clear()
+                    self.device_combo.addItems(device_list)
+                    self.device_display_map = device_display_map
+                    self.device_status_map = device_status_map
+
+                    if not self.current_device and device_list:
+                        self.device_combo.setCurrentIndex(0)
+                        self.on_device_selected(silent=silent)
+                    elif self.current_device and device_list:
+                        current_display = None
+                        for display_str, device_id in device_display_map.items():
+                            if device_id == self.current_device:
+                                current_display = display_str
+                                break
+
+                        if current_display:
+                            index = self.device_combo.findText(current_display)
+                            if index >= 0:
+                                self.device_combo.setCurrentIndex(index)
+                            # Refresh status styling in case status changed
+                            self.on_device_selected(silent=True)
+                        else:
+                            # Previously selected device is gone — bind to another one
+                            self.log(
+                                f"Device {self.current_device} disconnected; selecting another device",
+                                "WARNING",
+                            )
+                            self.current_device = None
+                            self.device_combo.setCurrentIndex(0)
+                            self.on_device_selected(silent=True)
+
+                    if not silent or devices_changed:
+                        self.update_status(f"Found {len(devices)} device(s)")
+                        if devices_changed:
+                            device_names = [
+                                f"{d.get('model', d.get('product', 'Unknown'))} [{d.get('status', '?')}] ({d['id']})"
+                                for d in devices
+                            ]
+                            self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}")
                 else:
-                    display_name = "Unknown Device"
-                
-                # Format: "Device Name (ID)"
-                display_str = f"{display_name} ({device_id})"
-                device_list.append(display_str)
-                device_display_map[display_str] = device_id
-            
-            # Only log if device list changed
-            devices_changed = current_device_ids != new_device_ids
-            
-            # Disconnect signal before modifying combo box to prevent unwanted triggers
-            self.device_combo.currentTextChanged.disconnect()
-            
-            self.device_combo.clear()
-            self.device_combo.addItems(device_list)
-            self.device_display_map = device_display_map  # Store mapping for selection
-            
-            # Only auto-select if no device is currently selected
-            was_no_device = not self.current_device
-            if was_no_device and device_list:
-                self.device_combo.setCurrentIndex(0)
-                # Call on_device_selected directly with silent parameter (signal is disconnected so won't trigger)
-                self.on_device_selected(silent=silent)  # Use silent parameter from refresh_devices
-            elif self.current_device and device_list:
-                # Device is already selected - just update the combo box index if needed
-                # Find the current device in the new list
-                current_display = None
-                for display_str, device_id in device_display_map.items():
-                    if device_id == self.current_device:
-                        current_display = display_str
-                        break
-                
-                if current_display:
-                    index = self.device_combo.findText(current_display)
-                    if index >= 0:
-                        self.device_combo.setCurrentIndex(index)
-                # Don't call on_device_selected when device is already selected (avoids redundant get_devices call)
-            
-            # Reconnect signal after all combo box operations are complete
-            self.device_combo.currentTextChanged.connect(self.on_device_selected)
-            
-            if not silent or devices_changed:
-                self.update_status(f"Found {len(devices)} device(s)")
-                if devices_changed:
-                    # Log with device names only when list changes
-                    device_names = [f"{d.get('model', d.get('product', 'Unknown'))} ({d['id']})" for d in devices]
-                    self.log(f"Found {len(devices)} device(s): {', '.join(device_names)}")
-        else:
-            had_devices = hasattr(self, 'device_display_map') and len(self.device_display_map) > 0
-            self.device_combo.clear()
-            self.current_device = None
-            self.device_info_label.setText("No devices connected - Check USB connection and USB debugging")
-            self.device_info_label.setStyleSheet(f"color: {self.colors['warning']};")
-            if not silent or had_devices:
-                self.update_status("No devices found")
-                if had_devices:
-                    self.log("No devices found. Make sure USB debugging is enabled and device is connected.", "WARNING")
+                    had_devices = hasattr(self, "device_display_map") and len(self.device_display_map) > 0
+                    self.device_combo.clear()
+                    self.current_device = None
+                    self.device_display_map = {}
+                    self.device_status_map = {}
+                    self.device_info_label.setText(
+                        "No devices connected - Check USB connection and USB debugging"
+                    )
+                    self.device_info_label.setStyleSheet(f"color: {self.colors['warning']};")
+                    if not silent or had_devices:
+                        self.update_status("No devices found")
+                        if had_devices:
+                            self.log(
+                                "No devices found. Make sure USB debugging is enabled and device is connected.",
+                                "WARNING",
+                            )
+                    # Notify open file explorer that the device is gone
+                    explorer = getattr(self, "_file_explorer", None)
+                    if explorer is not None and explorer.isVisible():
+                        explorer.on_device_context_changed()
+            finally:
+                if signal_disconnected:
+                    self.device_combo.currentTextChanged.connect(self.on_device_selected)
+        finally:
+            if pending is not None:
+                QTimer.singleShot(0, lambda: self.refresh_devices(silent=pending))
     
     def on_device_selected(self, selection=None, silent=False):
         """Handle device selection
@@ -803,19 +910,21 @@ class ADBGUI(QMainWindow):
                     self.current_device = selection.split('(')[1].split(')')[0].strip()
                 else:
                     self.current_device = selection.split()[0]
+
+            status = self.device_status_map.get(self.current_device, "device")
             
             # Get device info for display
             # In silent mode, skip get_devices call to avoid redundant logging
             if silent:
-                # In silent mode, just use the device ID we already have
-                # Don't call get_devices to avoid logging
                 device_info = None
-                # Set a simple display text without calling get_devices
                 display_text = f"Selected: {self.current_device}"
             else:
                 # Not in silent mode, get full device info
                 devices = self.adb.get_devices(silent=silent)
                 device_info = next((d for d in devices if d['id'] == self.current_device), None)
+                if device_info:
+                    status = device_info.get("status", status)
+                    self.device_status_map[self.current_device] = status
             
             if device_info:
                 model = device_info.get('model', 'Unknown')
@@ -826,18 +935,49 @@ class ADBGUI(QMainWindow):
                     display_text = f"Selected: {model} ({self.current_device})"
             else:
                 display_text = f"Selected: {self.current_device}"
+
+            if status != "device":
+                display_text += f" — {status}"
             
             # Only update UI and log if not in silent mode (for auto-refresh)
             if not silent:
                 self.device_info_label.setText(display_text)
-                self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
-                self.log(f"Selected device: {display_text}")
-            # In silent mode, only update the label if it's not already set correctly
-            elif not hasattr(self, 'device_info_label') or self.device_info_label.text() != display_text:
+                if status != "device":
+                    self.device_info_label.setStyleSheet(f"color: {self.colors['warning']};")
+                    self.log(
+                        f"Selected device: {display_text}. "
+                        f"Authorize USB debugging on the phone if status is unauthorized.",
+                        "WARNING",
+                    )
+                else:
+                    self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
+                    self.log(f"Selected device: {display_text}")
+            else:
                 self.device_info_label.setText(display_text)
-                self.device_info_label.setStyleSheet(f"color: {self.colors['success']};")
+                color = self.colors["warning"] if status != "device" else self.colors["success"]
+                self.device_info_label.setStyleSheet(f"color: {color};")
+
+            explorer = getattr(self, "_file_explorer", None)
+            if explorer is not None and explorer.isVisible():
+                explorer.on_device_context_changed()
         else:
             self.current_device = None
+
+    def require_device(self, allow_non_ready=False):
+        """Return True if a usable device is selected; otherwise warn and return False."""
+        if not self.current_device:
+            QMessageBox.warning(self, "No Device", "Please select a device first")
+            return False
+        status = self.device_status_map.get(self.current_device, "device")
+        if not allow_non_ready and status != "device":
+            QMessageBox.warning(
+                self,
+                "Device Not Ready",
+                f"Device status is '{status}'.\n\n"
+                "Accept the USB debugging prompt on the phone (or wait until it shows as 'device').",
+            )
+            return False
+        return True
     
     def show_device_info(self):
         """Show detailed device information"""
@@ -1002,8 +1142,7 @@ class ADBGUI(QMainWindow):
     
     def open_file_explorer(self):
         """Open the side-by-side PC ↔ Android file explorer."""
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
+        if not self.require_device():
             return
         # Reuse a single non-modal explorer instance per main window so the
         # user can leave it open while running other ADB operations.
@@ -1011,6 +1150,7 @@ class ADBGUI(QMainWindow):
         if existing is not None and existing.isVisible():
             existing.raise_()
             existing.activateWindow()
+            existing.on_device_context_changed()
             existing.refresh_remote()
             return
         explorer = FileExplorerDialog(self)
@@ -1019,8 +1159,7 @@ class ADBGUI(QMainWindow):
 
     def install_apk(self):
         """Install APK file"""
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
+        if not self.require_device():
             return
         
         apk_path, _ = QFileDialog.getOpenFileName(self, "Select APK file", "", "APK files (*.apk);;All files (*.*)")
@@ -1031,15 +1170,25 @@ class ADBGUI(QMainWindow):
         self.update_status("Installing APK...")
         
         def do_install():
-            result = self.adb.run_command(f'{self.get_device_flag()} install "{apk_path}"', timeout=120)
-            if result['success']:
+            result = self.adb.run_command(
+                f'{self.get_device_flag()} install {quote_cmd_arg(apk_path)}',
+                timeout=120,
+            )
+            if adb_install_succeeded(result):
                 self.log("APK installed successfully")
                 self.update_status("APK installed successfully")
-                QMessageBox.information(self, "Success", "APK installed successfully")
+                QTimer.singleShot(
+                    0,
+                    lambda: QMessageBox.information(self, "Success", "APK installed successfully"),
+                )
             else:
-                self.log(f"Error: {result['stderr']}", "ERROR")
+                err = (result.get("stderr") or result.get("stdout") or "Unknown error").strip()
+                self.log(f"Error: {err}", "ERROR")
                 self.update_status("Failed to install APK")
-                QMessageBox.critical(self, "Error", f"Failed to install APK:\n{result['stderr']}")
+                QTimer.singleShot(
+                    0,
+                    lambda e=err: QMessageBox.critical(self, "Error", f"Failed to install APK:\n{e}"),
+                )
         
         threading.Thread(target=do_install, daemon=True).start()
     
@@ -1377,17 +1526,18 @@ class ADBGUI(QMainWindow):
             # Running as script
             project_dir = os.path.dirname(os.path.abspath(__file__))
         apks_dir = os.path.join(project_dir, 'apks')
-        os.makedirs(apks_dir, exist_ok=True)
-        
-        # Open folder in file explorer
-        if sys.platform == 'win32':
-            os.startfile(apks_dir)
-        elif sys.platform == 'darwin':
-            subprocess.run(['open', apks_dir])
-        else:
-            subprocess.run(['xdg-open', apks_dir])
-        
-        self.log(f"Opened APKs folder: {apks_dir}")
+        try:
+            os.makedirs(apks_dir, exist_ok=True)
+            if sys.platform == 'win32':
+                os.startfile(apks_dir)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', apks_dir], check=False)
+            else:
+                subprocess.run(['xdg-open', apks_dir], check=False)
+            self.log(f"Opened APKs folder: {apks_dir}")
+        except Exception as e:
+            self.log(f"Failed to open APKs folder: {e}", "ERROR")
+            QMessageBox.warning(self, "Error", f"Could not open APKs folder:\n{apks_dir}\n\n{e}")
     
     def list_apps(self):
         """List installed apps with uninstall/reinstall options"""
@@ -1703,7 +1853,9 @@ class ADBGUI(QMainWindow):
                     local_apks.append(local_apk)
                     
                     self.log(f"Pulling APK {i+1}/{len(apk_paths)}: {os.path.basename(apk_path)}...")
-                    result = self.adb.run_command(f'{self.get_device_flag()} pull "{apk_path}" "{local_apk}"')
+                    result = self.adb.run_command(
+                        f'{self.get_device_flag()} pull {quote_cmd_arg(apk_path)} {quote_cmd_arg(local_apk)}'
+                    )
                     if not result['success']:
                         error_msg = result['stderr'] or "Unknown error"
                         self.log(f"Error pulling APK {i+1}: {error_msg}", "ERROR")
@@ -1737,13 +1889,16 @@ class ADBGUI(QMainWindow):
                 # Use install-multiple for split APKs, regular install for single APK
                 if len(local_apks) > 1:
                     # Install multiple APKs using install-multiple - quote each path to handle spaces
-                    apk_list = ' '.join(f'"{apk}"' for apk in local_apks)
+                    apk_list = ' '.join(quote_cmd_arg(apk) for apk in local_apks)
                     result = self.adb.run_command(f"{self.get_device_flag()} install-multiple {apk_list}", timeout=180)
                 else:
                     # Single APK - use regular install
-                    result = self.adb.run_command(f'{self.get_device_flag()} install "{local_apks[0]}"', timeout=120)
+                    result = self.adb.run_command(
+                        f'{self.get_device_flag()} install {quote_cmd_arg(local_apks[0])}',
+                        timeout=120,
+                    )
                 
-                if result['success']:
+                if adb_install_succeeded(result):
                     self.log("App reinstalled successfully")
                     self.update_status("App reinstalled successfully")
                     apk_locations = '\n'.join(local_apks)
@@ -1751,7 +1906,7 @@ class ADBGUI(QMainWindow):
                     QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", f"App reinstalled successfully!\n\nAPK(s) saved at:\n{apk_locations}"))
                     # Keep APKs in the folder for easy access - don't delete them
                 else:
-                    error_msg = result['stderr'] or "Unknown error"
+                    error_msg = (result.get('stderr') or result.get('stdout') or "Unknown error").strip()
                     self.log(f"Error installing: {error_msg}", "ERROR")
                     self.update_status("Failed to reinstall app")
                     apk_locations = '\n'.join(local_apks)
@@ -2334,9 +2489,25 @@ class ADBGUI(QMainWindow):
         
         self.log(f"Running shell command: {command}")
         self.update_status("Running command...")
+
+        # Support multi-line input: run each non-empty line as its own shell command
+        # (joined with " && " so a failure stops the chain, matching user expectation).
+        lines = [ln.strip() for ln in command.splitlines() if ln.strip()]
+        for i, line in enumerate(lines):
+            cleaned = line
+            if cleaned.startswith('adb '):
+                cleaned = cleaned[4:].strip()
+            if cleaned.startswith('shell '):
+                cleaned = cleaned[6:].strip()
+            lines[i] = cleaned
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            QMessageBox.warning(self, "Invalid Command", "Please enter a shell command to run on the device.")
+            return
+        shell_payload = " && ".join(lines) if len(lines) > 1 else lines[0]
         
         def do_command():
-            result = self.adb.run_command(f"{self.get_device_flag()} shell {command}")
+            result = self.adb.run_command(f"{self.get_device_flag()} shell {shell_payload}")
             if result['success']:
                 output = result['stdout'] if result['stdout'] else result['stderr']
                 if output:
@@ -2353,92 +2524,125 @@ class ADBGUI(QMainWindow):
     
     def toggle_logcat(self):
         """Start/stop logcat"""
-        if not self.current_device:
-            QMessageBox.warning(self, "No Device", "Please select a device first")
+        if not self.require_device():
             return
         
         if self.log_running:
             self.log_running = False
+            proc = self._logcat_process
+            self._logcat_process = None
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        proc.kill()
+                except Exception:
+                    pass
             self.log_button.setText("▶️ Start Logcat")
             self.log("Logcat stopped")
             self.update_status("Logcat stopped")
-        else:
-            self.log_running = True
-            self.log_button.setText("⏹️ Stop Logcat")
-            self.log("Starting logcat...")
-            self.update_status("Logcat running...")
-            
-            def run_logcat():
-                try:
-                    # Store device ID for thread safety
-                    device_id = self.current_device
-                    
-                    process = subprocess.Popen(
-                        [self.adb.adb_path, '-s', device_id, 'logcat'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        encoding='utf-8',
-                        errors='replace',
-                        bufsize=1,
-                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                    )
-                    
-                    # Check if process started successfully
-                    if process.poll() is not None:
-                        # Process already terminated
-                        stderr_output = process.stderr.read()
-                        error_msg = f"Logcat process failed to start: {stderr_output}"
-                        QTimer.singleShot(0, lambda: self.log(error_msg, "ERROR"))
-                        QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Logcat Error", error_msg))
-                        self.log_running = False
-                        QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
-                        return
-                    
-                    # Log that logcat started successfully
-                    QTimer.singleShot(0, lambda: self.log("Logcat process started, waiting for output...", "INFO"))
-                    
-                    # Read output line by line
-                    while self.log_running:
-                        line = process.stdout.readline()
-                        if line:
-                            # Use a closure to capture the line value properly
-                            line_text = line.strip()
-                            if line_text:  # Only log non-empty lines
-                                QTimer.singleShot(0, lambda l=line_text: self.log(l, "LOGCAT"))
-                        elif process.poll() is not None:
-                            # Process ended
-                            break
-                    
-                    # Clean up
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                    
-                    if self.log_running:
-                        # Process ended unexpectedly
-                        stderr_output = process.stderr.read()
-                        if stderr_output:
-                            QTimer.singleShot(0, lambda: self.log(f"Logcat process ended: {stderr_output}", "ERROR"))
-                        else:
-                            QTimer.singleShot(0, lambda: self.log("Logcat process ended unexpectedly", "WARNING"))
-                        self.log_running = False
-                        QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
-                        
-                except Exception as e:
-                    error_msg = f"Logcat error: {str(e)}"
+            return
+
+        self.log_running = True
+        self.log_button.setText("⏹️ Stop Logcat")
+        self.log("Starting logcat...")
+        self.update_status("Logcat running...")
+        
+        def run_logcat():
+            process = None
+            try:
+                device_id = self.current_device
+                
+                process = subprocess.Popen(
+                    [self.adb.adb_path, '-s', device_id, 'logcat'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    bufsize=1,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                self._logcat_process = process
+                
+                if process.poll() is not None:
+                    stderr_output = process.stderr.read()
+                    error_msg = f"Logcat process failed to start: {stderr_output}"
                     QTimer.singleShot(0, lambda: self.log(error_msg, "ERROR"))
-                    QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Logcat Error", error_msg))
+                    QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Logcat Error", error_msg))
                     self.log_running = False
+                    self._logcat_process = None
                     QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
-                    import traceback
-                    QTimer.singleShot(0, lambda: self.log(f"Traceback: {traceback.format_exc()}", "ERROR"))
-            
-            self.current_device = self.current_device  # Store for logcat thread
-            threading.Thread(target=run_logcat, daemon=True).start()
+                    return
+                
+                QTimer.singleShot(0, lambda: self.log("Logcat process started, waiting for output...", "INFO"))
+
+                batch = []
+                last_flush = datetime.now()
+
+                def flush_batch():
+                    nonlocal batch
+                    if not batch:
+                        return
+                    text = "\n".join(batch)
+                    batch = []
+                    QTimer.singleShot(0, lambda t=text: self.log(t, "LOGCAT"))
+                
+                while self.log_running:
+                    line = process.stdout.readline()
+                    if line:
+                        line_text = line.strip()
+                        if line_text:
+                            batch.append(line_text)
+                            now = datetime.now()
+                            if len(batch) >= 40 or (now - last_flush).total_seconds() >= 0.25:
+                                flush_batch()
+                                last_flush = now
+                    elif process.poll() is not None:
+                        break
+                    else:
+                        if batch and (datetime.now() - last_flush).total_seconds() >= 0.25:
+                            flush_batch()
+                            last_flush = datetime.now()
+
+                flush_batch()
+                
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=2)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                
+                if self.log_running:
+                    stderr_output = process.stderr.read() if process.stderr else ""
+                    if stderr_output:
+                        QTimer.singleShot(0, lambda: self.log(f"Logcat process ended: {stderr_output}", "ERROR"))
+                    else:
+                        QTimer.singleShot(0, lambda: self.log("Logcat process ended unexpectedly", "WARNING"))
+                    self.log_running = False
+                    self._logcat_process = None
+                    QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
+                    
+            except Exception as e:
+                error_msg = f"Logcat error: {str(e)}"
+                QTimer.singleShot(0, lambda: self.log(error_msg, "ERROR"))
+                QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Logcat Error", error_msg))
+                self.log_running = False
+                self._logcat_process = None
+                QTimer.singleShot(0, lambda: self.log_button.setText("▶️ Start Logcat"))
+                import traceback
+                QTimer.singleShot(0, lambda: self.log(f"Traceback: {traceback.format_exc()}", "ERROR"))
+            finally:
+                if self._logcat_process is process:
+                    self._logcat_process = None
+        
+        threading.Thread(target=run_logcat, daemon=True).start()
     
     def load_settings(self):
         """Load settings from file"""
@@ -2446,7 +2650,13 @@ class ADBGUI(QMainWindow):
             try:
                 with open(self.settings_file, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception as e:
+                msg = (
+                    f"Could not read settings.json ({e}). "
+                    "Settings were reset to defaults; your previous preferences may be lost."
+                )
+                if hasattr(self, "_json_load_warnings"):
+                    self._json_load_warnings.append(msg)
                 return {}
         return {}
     
@@ -2456,7 +2666,10 @@ class ADBGUI(QMainWindow):
             with open(self.settings_file, 'w') as f:
                 json.dump(self.settings, f, indent=2)
         except Exception as e:
-            self.log(f"Error saving settings: {e}", "ERROR")
+            if hasattr(self, "output_text"):
+                self.log(f"Error saving settings: {e}", "ERROR")
+            else:
+                print(f"Error saving settings: {e}")
     
     def load_degoogle_state(self):
         """Load DeGoogle state from file"""
@@ -2464,7 +2677,14 @@ class ADBGUI(QMainWindow):
             try:
                 with open(self.degoogle_state_file, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception as e:
+                msg = (
+                    f"Could not read degoogle_state.json ({e}). "
+                    "Undo DeGoogle history was reset; packages disabled on the device "
+                    "are not automatically rediscovered."
+                )
+                if hasattr(self, "_json_load_warnings"):
+                    self._json_load_warnings.append(msg)
                 return {}
         return {}
     
@@ -2474,7 +2694,10 @@ class ADBGUI(QMainWindow):
             with open(self.degoogle_state_file, 'w') as f:
                 json.dump(self.degoogle_state, f, indent=2)
         except Exception as e:
-            self.log(f"Error saving DeGoogle state: {e}", "ERROR")
+            if hasattr(self, "output_text"):
+                self.log(f"Error saving DeGoogle state: {e}", "ERROR")
+            else:
+                print(f"Error saving DeGoogle state: {e}")
     
     def apply_theme(self):
         """Apply light or dark theme"""
@@ -3004,44 +3227,74 @@ class ADBGUI(QMainWindow):
             if include_risky:
                 candidates.extend(p for p in RISKY_GOOGLE_PACKAGES if p not in candidates)
             candidates = [p for p in candidates if p not in unsafe_set]
-            
-            installed = self._get_installed_packages()
-            packages_to_process = [p for p in candidates if p in installed]
-            
-            # Confirm with the user
-            preview_lines = [f"This will {action} {len(packages_to_process)} Google package(s):", ""]
-            if packages_to_process:
-                preview_lines.append("Packages to be removed:")
-                for pkg in sorted(packages_to_process):
-                    preview_lines.append(f"• {pkg}")
-            preview_lines.extend([
-                "",
-                f"Include risky services: {include_risky}",
-                f"Action: {action}",
-                "",
-                "Continue?",
-            ])
-            reply = QMessageBox.question(
-                self,
-                "Preview - Confirm DeGoogle",
-                "\n".join(preview_lines),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            
-            self.log(f"Starting DeGoogle process for {len(packages_to_process)} package(s)...")
-            self.update_status("DeGoogling device...")
-            
-            def process_degoogle():
-                disabled, uninstalled, failed = self._process_packages(packages_to_process, action)
-                self._save_degoogle_action(action, disabled, uninstalled, include_risky=include_risky)
-                
-                msg = self._build_results_message(action, disabled, uninstalled, failed)
-                self.update_status("DeGoogle completed")
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "DeGoogle Complete", msg))
-            
-            threading.Thread(target=process_degoogle, daemon=True).start()
+
+            self.log("Scanning installed packages for DeGoogle...")
+            self.update_status("Scanning packages...")
+
+            def scan_and_confirm():
+                try:
+                    installed = self._get_installed_packages()
+                    packages_to_process = [p for p in candidates if p in installed]
+                except Exception as e:
+                    QTimer.singleShot(
+                        0,
+                        lambda: QMessageBox.critical(
+                            self, "Error", f"Failed to scan packages:\n{e}"
+                        ),
+                    )
+                    self.update_status("DeGoogle cancelled")
+                    return
+
+                def ask_and_run():
+                    preview_lines = [
+                        f"This will {action} {len(packages_to_process)} Google package(s):",
+                        "",
+                    ]
+                    if packages_to_process:
+                        preview_lines.append("Packages to be removed:")
+                        for pkg in sorted(packages_to_process):
+                            preview_lines.append(f"• {pkg}")
+                    preview_lines.extend([
+                        "",
+                        f"Include risky services: {include_risky}",
+                        f"Action: {action}",
+                        "",
+                        "Continue?",
+                    ])
+                    reply = QMessageBox.question(
+                        self,
+                        "Preview - Confirm DeGoogle",
+                        "\n".join(preview_lines),
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        self.update_status("DeGoogle cancelled")
+                        return
+
+                    self.log(f"Starting DeGoogle process for {len(packages_to_process)} package(s)...")
+                    self.update_status("DeGoogling device...")
+
+                    def process_degoogle():
+                        disabled, uninstalled, failed = self._process_packages(
+                            packages_to_process, action
+                        )
+                        self._save_degoogle_action(
+                            action, disabled, uninstalled, include_risky=include_risky
+                        )
+                        msg = self._build_results_message(
+                            action, disabled, uninstalled, failed
+                        )
+                        self.update_status("DeGoogle completed")
+                        QTimer.singleShot(
+                            0,
+                            lambda: QMessageBox.information(self, "DeGoogle Complete", msg),
+                        )
+
+                    threading.Thread(target=process_degoogle, daemon=True).start()
+
+                QTimer.singleShot(0, ask_and_run)
+
+            threading.Thread(target=scan_and_confirm, daemon=True).start()
         
         button_frame = QHBoxLayout()
         button_frame.addStretch()
@@ -3284,7 +3537,10 @@ class ADBGUI(QMainWindow):
         else:
             QMessageBox.information(
                 self, "Nothing to Restore",
-                "No disabled or uninstalled Google packages found in saved state.",
+                "No DeGoogle history found for this device serial in degoogle_state.json.\n\n"
+                "Undo only restores packages this app previously disabled/uninstalled "
+                "and saved to that file. If the file was deleted or the device serial "
+                "changed, use App Management → enable / reinstall packages manually.",
             )
     
     def show_restore_dialog(self, device_id, disabled_packages, uninstalled_packages):
@@ -3396,32 +3652,47 @@ class ADBGUI(QMainWindow):
                 restored = []
                 failed = []
                 flag = self.get_device_flag()
-                all_packages = selected_disabled + selected_uninstalled
-                
-                for i, package in enumerate(all_packages, start=1):
-                    self.log(f"Restoring {i}/{len(all_packages)}: {package}")
-                    errors = []
-                    
-                    # install-existing handles uninstalled packages.
-                    r1 = self.adb.run_command(f"{flag} shell pm install-existing {package}")
-                    if r1['success']:
-                        output = (r1.get('stdout') or '').strip()
-                        self.log(f"Reinstalled: {package} (output: {output})")
-                        restored.append(package)
-                        continue
-                    errors.append(f"install-existing: {r1.get('stderr') or r1.get('stdout') or 'Unknown error'}")
-                    
-                    # Fall back to pm enable for disabled packages.
-                    r2 = self.adb.run_command(f"{flag} shell pm enable {package}")
-                    if r2['success']:
+
+                # Disabled packages: enable first (they are still installed).
+                for i, package in enumerate(selected_disabled, start=1):
+                    self.log(f"Enabling {i}/{len(selected_disabled)}: {package}")
+                    r = self.adb.run_command(f"{flag} shell pm enable {package}")
+                    if r["success"]:
                         self.log(f"Enabled: {package}")
                         restored.append(package)
-                        continue
-                    errors.append(f"enable: {r2.get('stderr') or r2.get('stdout') or 'Unknown error'}")
-                    
-                    error_msg = " | ".join(errors)
-                    failed.append((package, error_msg))
-                    self.log(f"Failed to restore {package}: {error_msg}", "ERROR")
+                    else:
+                        err = r.get("stderr") or r.get("stdout") or "Unknown error"
+                        failed.append((package, f"enable: {err}"))
+                        self.log(f"Failed to enable {package}: {err}", "ERROR")
+
+                # Uninstalled packages: restore with install-existing.
+                for i, package in enumerate(selected_uninstalled, start=1):
+                    self.log(
+                        f"Reinstalling {i}/{len(selected_uninstalled)}: {package}"
+                    )
+                    r = self.adb.run_command(
+                        f"{flag} shell pm install-existing {package}"
+                    )
+                    if r["success"]:
+                        output = (r.get("stdout") or "").strip()
+                        self.log(f"Reinstalled: {package} (output: {output})")
+                        restored.append(package)
+                    else:
+                        # Some OEMs leave the package disabled after user uninstall;
+                        # try enable as a secondary path.
+                        r2 = self.adb.run_command(f"{flag} shell pm enable {package}")
+                        if r2["success"]:
+                            self.log(f"Enabled after install-existing failed: {package}")
+                            restored.append(package)
+                        else:
+                            err = (
+                                r.get("stderr")
+                                or r.get("stdout")
+                                or r2.get("stderr")
+                                or "Unknown error"
+                            )
+                            failed.append((package, f"install-existing: {err}"))
+                            self.log(f"Failed to restore {package}: {err}", "ERROR")
                 
                 # Update saved state - drop restored packages from each list.
                 state = self.degoogle_state.get(device_id, {})
@@ -3655,10 +3926,12 @@ class FileExplorerDialog(QDialog):
         super().__init__(parent_gui)
         self.gui = parent_gui
         self.adb = parent_gui.adb
+        self._bound_device = parent_gui.current_device
 
         self.local_path = self._initial_local_path()
         self.remote_path = "/sdcard/"
         self._remote_busy = False
+        self._pending_remote_path = None
         self._transfer_busy = False
 
         self.setWindowTitle("File Explorer — PC ↔ Android")
@@ -3670,6 +3943,23 @@ class FileExplorerDialog(QDialog):
 
         self.refresh_local()
         self.refresh_remote()
+
+    def on_device_context_changed(self):
+        """Called when the main window's selected device changes or disconnects."""
+        new_id = self.gui.current_device
+        if new_id != self._bound_device:
+            self._bound_device = new_id
+            if not new_id:
+                self.remote_tree.clear()
+                self.remote_summary.setText("(no device selected)")
+                self._set_status("Device disconnected", "warning")
+            else:
+                self._set_status(f"Device changed to {new_id}; refreshing…", "warning")
+                self.refresh_remote()
+        elif not new_id:
+            self.remote_tree.clear()
+            self.remote_summary.setText("(no device selected)")
+            self._set_status("No device selected", "warning")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -3925,6 +4215,18 @@ class FileExplorerDialog(QDialog):
         if not self.gui.current_device:
             QMessageBox.warning(self, "No Device", "Please select a device first.")
             return False
+        status = getattr(self.gui, "device_status_map", {}).get(
+            self.gui.current_device, "device"
+        )
+        if status != "device":
+            QMessageBox.warning(
+                self,
+                "Device Not Ready",
+                f"Device status is '{status}'. Authorize USB debugging first.",
+            )
+            return False
+        if self._bound_device and self.gui.current_device != self._bound_device:
+            self.on_device_context_changed()
         return True
 
     @staticmethod
@@ -4191,7 +4493,10 @@ class FileExplorerDialog(QDialog):
             self.remote_summary.setText("(no device selected)")
             return
         if self._remote_busy:
+            # Queue the latest requested path; worker completion will re-list it.
+            self._pending_remote_path = self.remote_path
             return
+        self._pending_remote_path = None
         self._remote_busy = True
         self._set_status(f"Listing {self.remote_path}…")
         path = self.remote_path
@@ -4216,26 +4521,34 @@ class FileExplorerDialog(QDialog):
             self.remote_listing_ready.emit(path, [], err)
             return
         entries, parse_err = self._parse_ls_output(result["stdout"])
+        stderr = (result.get("stderr") or "").strip()
+        if stderr and not entries and not parse_err:
+            parse_err = stderr
+        elif stderr and "Permission denied" in stderr and not parse_err:
+            parse_err = stderr
         self.remote_listing_ready.emit(path, entries, parse_err or "")
 
     @staticmethod
     def _parse_ls_output(text):
         """Parse `ls -lA` output from Android (toybox) into a list of dicts.
 
-        Returns (entries, error_message). error_message is non-empty only if
-        nothing could be parsed but text was non-empty.
+        Returns (entries, error_message). error_message is non-empty when
+        permission / ls errors were present (and may accompany partial entries).
         """
         entries = []
+        errors = []
         if not text:
             return entries, ""
         for raw in text.splitlines():
             line = raw.rstrip()
             if not line or line.startswith("total "):
                 continue
-            # Skip `ls: <path>: Permission denied` style errors but bubble up.
+            # Collect `ls: <path>: Permission denied` style errors.
             if line.startswith("ls:"):
+                errors.append(line)
                 continue
             # Expected: perms links owner group size date time name [-> target]
+            # maxsplit=7 keeps the full filename (including spaces) in the last field.
             parts = line.split(None, 7)
             if len(parts) < 8:
                 # Some block/char devices have an extra "size, minor" column;
@@ -4287,13 +4600,17 @@ class FileExplorerDialog(QDialog):
                     "link_target": link_target,
                 }
             )
-        return entries, ""
+        return entries, ("; ".join(errors) if errors else "")
 
     def _on_remote_listing_ready(self, path, entries, error):
         self._remote_busy = False
+        pending = self._pending_remote_path
+        self._pending_remote_path = None
+
         # If the user moved on to a different path while we were listing,
-        # ignore stale results.
+        # discard stale results and list the current path.
         if path != self.remote_path:
+            self.refresh_remote()
             return
 
         self.remote_path_edit.setText(self.remote_path)
@@ -4304,6 +4621,8 @@ class FileExplorerDialog(QDialog):
             self._set_status(f"Error: {error}", "error")
             self.remote_summary.setText("(error)")
             self.remote_tree.setSortingEnabled(True)
+            if pending and pending != path:
+                self.refresh_remote()
             return
 
         entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
@@ -4332,10 +4651,16 @@ class FileExplorerDialog(QDialog):
                 file_count += 1
 
         self.remote_tree.setSortingEnabled(True)
-        self.remote_summary.setText(
-            f"{dir_count} folder(s), {file_count} file(s)"
-        )
-        self._set_status(f"Listed {self.remote_path}", "success")
+        summary = f"{dir_count} folder(s), {file_count} file(s)"
+        if error:
+            summary += " — some entries inaccessible"
+            self._set_status(f"Listed {self.remote_path} ({error})", "warning")
+        else:
+            self._set_status(f"Listed {self.remote_path}", "success")
+        self.remote_summary.setText(summary)
+
+        if pending and pending != path:
+            self.refresh_remote()
 
     def _navigate_remote(self, path):
         path = (path or "").strip()
@@ -4362,8 +4687,17 @@ class FileExplorerDialog(QDialog):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
             return
-        if data["is_dir"] or data["is_link"]:
+        if data["is_dir"]:
             target = self._posix_join(self.remote_path, data["name"])
+            self._navigate_remote(target)
+        elif data["is_link"]:
+            # Prefer the symlink target when available; otherwise try the link path.
+            target = data.get("link_target") or self._posix_join(
+                self.remote_path, data["name"]
+            )
+            if not target.startswith("/"):
+                target = self._posix_join(self.remote_path, target)
+            self._set_status(f"Following symlink → {target}")
             self._navigate_remote(target)
 
     def _selected_remote_entries(self):
@@ -4566,7 +4900,7 @@ class FileExplorerDialog(QDialog):
             failed = []
             succeeded = 0
             for src in sources:
-                cmd = f'{flag} push "{src}" "{dest_dir}"'
+                cmd = f'{flag} push {quote_cmd_arg(src)} {quote_cmd_arg(dest_dir)}'
                 r = self.adb.run_command(cmd, timeout=600)
                 if r["success"]:
                     succeeded += 1
@@ -4615,7 +4949,7 @@ class FileExplorerDialog(QDialog):
             failed = []
             succeeded = 0
             for src in sources:
-                cmd = f'{flag} pull "{src}" "{dest_dir}"'
+                cmd = f'{flag} pull {quote_cmd_arg(src)} {quote_cmd_arg(dest_dir)}'
                 r = self.adb.run_command(cmd, timeout=600)
                 if r["success"]:
                     succeeded += 1

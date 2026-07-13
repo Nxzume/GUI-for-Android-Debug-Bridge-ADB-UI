@@ -1,7 +1,4 @@
 # ADB Tool for Windows
-<img width="1200" height="800" alt="image" src="https://github.com/user-attachments/assets/bd812f38-85b2-49c1-bb1b-b520e8a7dff1" />
-
-
 
 A modern, user-friendly GUI application for Android Debug Bridge (ADB) operations on Windows, built with PyQt6.
 

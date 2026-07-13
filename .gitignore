@@ -42,4 +42,3 @@ dist/*
 !dist/ADB_GUI.exe
 *.spec.bak
 *.pyc
-
