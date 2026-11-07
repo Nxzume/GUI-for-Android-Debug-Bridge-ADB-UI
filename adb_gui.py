@@ -5,6 +5,7 @@ import os
 import shlex
 import tempfile
 import json
+import re
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -17,6 +18,14 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QUrl
 from PyQt6.QtGui import QFont, QColor, QPalette, QDrag
+
+
+def strip_ansi_codes(text):
+    """Remove ANSI escape codes from text (e.g., color codes from ls output)."""
+    # ANSI escape sequences start with ESC (ASCII 27) or \033 or \x1b
+    # Pattern: \x1b\[...m or \x1b\[...K or similar
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*[mK]')
+    return ansi_escape.sub('', text)
 
 
 def quote_cmd_arg(path):
@@ -4520,7 +4529,9 @@ class FileExplorerDialog(QDialog):
             err = (result.get("stderr") or result.get("stdout") or "Unknown error").strip()
             self.remote_listing_ready.emit(path, [], err)
             return
-        entries, parse_err = self._parse_ls_output(result["stdout"])
+        # Strip ANSI color codes from output (Fire OS 8 ignores --color=never)
+        stdout_clean = strip_ansi_codes(result["stdout"])
+        entries, parse_err = self._parse_ls_output(stdout_clean)
         stderr = (result.get("stderr") or "").strip()
         if stderr and not entries and not parse_err:
             parse_err = stderr
